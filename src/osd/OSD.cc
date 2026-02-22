@@ -1609,20 +1609,100 @@ OSDMapRef OSDService::try_get_map(epoch_t epoch)
     }
   }
 
-  OSDMap *map = new OSDMap;
-  if (epoch > 0) {
-    dout(20) << "get_map " << epoch << " - loading and decoding " << map << dendl;
+  if (epoch == 0) {
+    OSDMap *map = new OSDMap;
+    dout(20) << "get_map " << epoch << " - return initial " << map << dendl;
+    return _add_map(map);
+  }
+
+  dout(20) << "get_map " << epoch << " - loading" << dendl;
+  epoch_t cp = osd->last_checkpoint_epoch;
+
+  // For epochs at or below the last checkpoint, a full map may exist on disk
+  // (checkpoint epochs or epochs written before incremental-only was enabled).
+  // For epochs above the checkpoint, skip the disk read — we know only
+  // incrementals were written.
+  if (cp == 0 || epoch <= cp) {
     bufferlist bl;
-    if (!_get_map_bl(epoch, bl) || bl.length() == 0) {
-      derr << "failed to load OSD map for epoch " << epoch << ", got " << bl.length() << " bytes" << dendl;
-      delete map;
+    if (_get_map_bl(epoch, bl) && bl.length() > 0) {
+      OSDMap *map = new OSDMap;
+      map->decode(bl);
+      return _add_map(map);
+    }
+    if (cp == 0) {
+      derr << "failed to load OSD map for epoch " << epoch << dendl;
       return OSDMapRef();
     }
-    map->decode(bl);
-  } else {
-    dout(20) << "get_map " << epoch << " - return initial " << map << dendl;
+    // Fall through to incremental replay — epoch is between old checkpoints.
   }
-  return _add_map(map);
+
+  // Rebuild from checkpoint + incrementals.
+  // NOTE: map_cache_lock is held for the entire rebuild. This is acceptable
+  // because this path is only hit when a map is evicted from cache AND has
+  // no full map on disk — a rare condition bounded by max_pending epochs.
+  // The backward scan hits a checkpoint within max_pending steps.
+  OSDMapRef base;
+  epoch_t base_epoch = 0;
+  epoch_t oldest = osd->superblock.get_oldest_map();
+
+  // Scan backward for the nearest base. For epoch > cp, start from cp
+  // (no full maps above cp). For epoch <= cp, start from epoch - 1.
+  epoch_t scan_start = (epoch > cp) ? cp : epoch - 1;
+  for (epoch_t e = scan_start; e >= oldest && e > 0; e--) {
+    base = map_cache.lookup(e);
+    if (base) {
+      base_epoch = e;
+      break;
+    }
+    // Try loading full map from disk (hits at checkpoint epochs).
+    bufferlist fbl;
+    if (_get_map_bl(e, fbl) && fbl.length() > 0) {
+      OSDMap *o = new OSDMap;
+      o->decode(fbl);
+      base = _add_map(o);
+      base_epoch = e;
+      break;
+    }
+  }
+
+  if (!base) {
+    derr << "get_map " << epoch << " - no base map found" << dendl;
+    return OSDMapRef();
+  }
+
+  // Replay incrementals forward from base to epoch.
+  OSDMapRef cur = base;
+  for (epoch_t e = base_epoch + 1; e <= epoch; e++) {
+    OSDMapRef cached = map_cache.lookup(e);
+    if (cached) {
+      cur = cached;
+      continue;
+    }
+    bufferlist inc_bl;
+    if (store->read(meta_ch,
+	  OSD::get_inc_osdmap_pobject_name(e), 0, 0, inc_bl,
+	  CEPH_OSD_OP_FLAG_FADVISE_WILLNEED) < 0 ||
+	inc_bl.length() == 0) {
+      derr << "get_map " << epoch << " - missing incremental " << e
+	   << " during rebuild" << dendl;
+      return OSDMapRef();
+    }
+    OSDMap *o = new OSDMap;
+    o->deepish_copy_from(*cur);
+    OSDMap::Incremental inc;
+    auto p = inc_bl.cbegin();
+    inc.decode(p);
+    if (o->apply_incremental(inc) < 0) {
+      derr << "get_map " << epoch << " - failed to apply incremental "
+	   << e << dendl;
+      delete o;
+      return OSDMapRef();
+    }
+    cur = _add_map(o);
+  }
+  dout(10) << "get_map " << epoch << " - rebuilt from epoch "
+	   << base_epoch << " + incrementals" << dendl;
+  return cur;
 }
 
 // ops
@@ -2447,6 +2527,7 @@ OSD::OSD(CephContext *cct_,
     &osd_op_tp),
   last_pg_create_epoch(0),
   boot_finisher(cct),
+  map_checkpoint_finisher(cct),
   up_thru_wanted(0),
   requested_full_first(0),
   requested_full_last(0),
@@ -3680,6 +3761,7 @@ int OSD::init()
   service.sleep_timer.init();
 
   boot_finisher.start();
+  map_checkpoint_finisher.start();
 
   {
     string val;
@@ -3798,6 +3880,12 @@ int OSD::init()
     r = -EINVAL;
     goto out;
   }
+  // Read max_pending once at init — changing it at runtime would break
+  // the trim guard that protects incrementals without full maps.
+  map_checkpoint_max_pending = cct->_conf.get_val<int64_t>("osd_map_checkpoint_max_pending");
+
+  // Replay any incrementals that don't have full maps on disk
+  replay_osdmap_incrementals();
   osdmap = get_map(superblock.current_epoch);
   set_osdmap(osdmap);
 
@@ -4732,10 +4820,12 @@ int OSD::shutdown()
   service.agent_stop();
 
   boot_finisher.wait_for_empty();
+  map_checkpoint_finisher.wait_for_empty();
 
   osd_lock.lock();
 
   boot_finisher.stop();
+  map_checkpoint_finisher.stop();
   reset_heartbeat_peers(true);
 
   tick_timer.shutdown();
@@ -7394,6 +7484,146 @@ void OSD::maybe_send_beacon()
   }
 }
 
+// --- Incremental OSDMap checkpoint ---
+
+void OSD::queue_map_checkpoint(epoch_t epoch, OSDMapRef osdmap,
+			       uint64_t features)
+{
+  ceph_assert(ceph_mutex_is_locked(osd_lock));
+  std::lock_guard cl(service.map_cache_lock);
+  ceph_assert(!checkpoint_inflight);
+  checkpoint_inflight = true;
+  dout(10) << __func__ << " queuing checkpoint for epoch " << epoch
+	   << " (last checkpoint " << last_checkpoint_epoch << ")" << dendl;
+
+  map_checkpoint_finisher.queue(
+    new LambdaContext([this, epoch, osdmap, features](int) {
+      bufferlist fbl;
+      osdmap->encode(fbl, features | CEPH_FEATURE_RESERVED);
+
+      ObjectStore::Transaction t;
+      t.write(coll_t::meta(), get_osdmap_pobject_name(epoch),
+	      0, fbl.length(), fbl);
+      int r = store->queue_transaction(service.meta_ch, std::move(t), nullptr);
+
+      std::lock_guard l(service.map_cache_lock);
+      if (r < 0) {
+	derr << "map_checkpoint: failed to write epoch " << epoch
+	     << ": " << cpp_strerror(r) << dendl;
+      } else {
+	last_checkpoint_epoch = epoch;
+	dout(10) << "map_checkpoint: checkpointed epoch " << epoch << dendl;
+      }
+      checkpoint_inflight = false;
+    }));
+}
+
+void OSD::flush_checkpoint()
+{
+  {
+    std::lock_guard l(service.map_cache_lock);
+    if (!checkpoint_inflight) {
+      return;
+    }
+  }
+  // Finisher takes map_cache_lock (not osd_lock), so safe to wait
+  // while holding osd_lock.
+  map_checkpoint_finisher.wait_for_empty();
+}
+
+void OSD::replay_osdmap_incrementals()
+{
+  epoch_t newest = superblock.get_newest_map();
+  epoch_t oldest = superblock.get_oldest_map();
+  if (newest == 0 || oldest == 0) {
+    return;
+  }
+
+  // Scan backward from newest_map to find the last epoch with a full map.
+  // We read from disk directly — the map cache is empty at this point
+  // because this runs during init() before any maps are loaded.
+  epoch_t checkpoint = 0;
+  OSDMapRef cur;
+  for (epoch_t e = newest; e >= oldest; e--) {
+    bufferlist bl;
+    if (store->read(service.meta_ch,
+		    get_osdmap_pobject_name(e), 0, 0, bl) >= 0 &&
+	bl.length() > 0) {
+      OSDMap *o = new OSDMap;
+      o->decode(bl);
+      cur = service.add_map(o);
+      checkpoint = e;
+      break;
+    }
+    if (e == 0) break;
+  }
+
+  if (!cur) {
+    derr << __func__ << " no full osdmap found on disk" << dendl;
+    return;
+  }
+
+  {
+    std::lock_guard l(service.map_cache_lock);
+    last_checkpoint_epoch = checkpoint;
+  }
+
+  // Find the actual gap to the previous checkpoint on disk.
+  // Use the max of config max_pending and actual gap, so the trim guard
+  // protects all epochs even if max_pending was decreased since last run.
+  if (checkpoint > oldest) {
+    for (epoch_t e = checkpoint - 1; e >= oldest; e--) {
+      bufferlist bl;
+      if (store->read(service.meta_ch,
+		      get_osdmap_pobject_name(e), 0, 0, bl) >= 0 &&
+	  bl.length() > 0) {
+	epoch_t actual_gap = checkpoint - e;
+	if (actual_gap > map_checkpoint_max_pending) {
+	  dout(1) << __func__ << " actual checkpoint gap " << actual_gap
+		  << " > configured max_pending " << map_checkpoint_max_pending
+		  << ", adjusting" << dendl;
+	  map_checkpoint_max_pending = actual_gap;
+	}
+	break;
+      }
+      if (e == 0) break;
+    }
+  }
+
+  if (checkpoint >= newest) {
+    dout(10) << __func__ << " newest map " << newest
+	     << " has full map on disk, no replay needed" << dendl;
+    return;
+  }
+
+  dout(1) << __func__ << " replaying incrementals from " << checkpoint
+	  << " to " << newest << dendl;
+
+  for (epoch_t e = checkpoint + 1; e <= newest; e++) {
+    bufferlist inc_bl;
+    if (store->read(service.meta_ch,
+		    get_inc_osdmap_pobject_name(e), 0, 0, inc_bl) < 0 ||
+	inc_bl.length() == 0) {
+      derr << __func__ << " missing incremental map " << e << dendl;
+      ceph_abort_msg("missing osdmap incremental during replay");
+    }
+
+    OSDMap *o = new OSDMap;
+    o->deepish_copy_from(*cur);
+    OSDMap::Incremental inc;
+    auto p = inc_bl.cbegin();
+    inc.decode(p);
+    if (o->apply_incremental(inc) < 0) {
+      derr << __func__ << " failed to apply incremental " << e << dendl;
+      ceph_abort_msg("failed to apply osdmap incremental during replay");
+    }
+    cur = service.add_map(o);
+    dout(10) << __func__ << " replayed incremental map " << e << dendl;
+  }
+
+  dout(1) << __func__ << " done, replayed up to epoch " << newest << dendl;
+}
+
 void OSD::handle_command(MCommand *m)
 {
   ConnectionRef con = m->get_connection();
@@ -8089,6 +8319,19 @@ void OSD::osdmap_subscribe(version_t epoch, bool force_request)
 void OSD::trim_maps(epoch_t oldest)
 {
   epoch_t min = std::min(oldest, service.map_cache.cached_key_lower_bound());
+  // Don't trim into the range of epochs that may lack full maps on disk.
+  // Protect last_checkpoint - max_pending, since up to max_pending epochs
+  // may exist without a full map between checkpoints.
+  {
+    std::lock_guard cl(service.map_cache_lock);
+    if (last_checkpoint_epoch > 0) {
+      epoch_t safe = last_checkpoint_epoch > map_checkpoint_max_pending
+	? last_checkpoint_epoch - map_checkpoint_max_pending : 0;
+      if (safe > 0 && min > safe) {
+	min = safe;
+      }
+    }
+  }
   dout(20) <<  __func__ << ": min=" << min << " oldest_map="
            << superblock.get_oldest_map() << dendl;
   if (min <= superblock.get_oldest_map())
@@ -8362,9 +8605,7 @@ void OSD::handle_osd_map(MOSDMap *m)
 	ceph_abort_msg("bad fsid");
       }
 
-      bufferlist fbl;
-      o->encode(fbl, inc.encode_features | CEPH_FEATURE_RESERVED);
-
+      // Verify CRC if available
       bool injected_failure = false;
       if (cct->_conf->osd_inject_bad_map_crc_probability > 0 &&
 	  (rand() % 10000) < cct->_conf->osd_inject_bad_map_crc_probability*10000.0) {
@@ -8374,17 +8615,14 @@ void OSD::handle_osd_map(MOSDMap *m)
 
       if ((inc.have_crc && o->get_crc() != inc.full_crc) || injected_failure) {
 	dout(2) << "got incremental " << e
-		<< " but failed to encode full with correct crc; requesting"
+		<< " but failed to verify crc; requesting full map"
 		<< dendl;
-	clog->warn() << "failed to encode map e" << e << " with expected crc";
-	dout(20) << "my encoded map was:\n";
-	fbl.hexdump(*_dout);
-	*_dout << dendl;
+	clog->warn() << "failed to verify map e" << e << " with expected crc";
 	delete o;
 	request_full_map(e, last);
 	last = e - 1;
 
-	// don't continue committing if we failed to enc the first inc map
+	// don't continue committing if we failed on the first inc map
 	if (last < start) {
 	  dout(10) << __func__ << " bailing because last < start (" << last << "<" << start << ")" << dendl;
 	  m->put();
@@ -8395,9 +8633,37 @@ void OSD::handle_osd_map(MOSDMap *m)
       got_full_map(e);
       purged_snaps[e] = o->get_new_purged_snaps();
 
-      ghobject_t fulloid = get_osdmap_pobject_name(e);
-      t.write(coll_t::meta(), fulloid, 0, fbl.length(), fbl);
       added_maps[e] = add_map(o);
+
+      // Checkpoint full map periodically.
+      // Read state under lock, decide, then act outside lock.
+      {
+	bool do_async = false;
+	bool do_sync = false;
+	{
+	  std::lock_guard cl(service.map_cache_lock);
+	  if (last_checkpoint_epoch > 0) {
+	    int interval = cct->_conf.get_val<int64_t>("osd_map_checkpoint_interval");
+	    epoch_t gap = e - last_checkpoint_epoch;
+	    if (map_checkpoint_max_pending > 0 &&
+		gap >= map_checkpoint_max_pending) {
+	      do_sync = true;
+	    } else if (interval > 0 && gap >= (epoch_t)interval &&
+		       !checkpoint_inflight) {
+	      do_async = true;
+	    }
+	  }
+	}
+	if (do_sync) {
+	  flush_checkpoint();
+	  queue_map_checkpoint(e, added_maps[e],
+			       inc.encode_features | CEPH_FEATURE_RESERVED);
+	  flush_checkpoint();
+	} else if (do_async) {
+	  queue_map_checkpoint(e, added_maps[e],
+			       inc.encode_features | CEPH_FEATURE_RESERVED);
+	}
+      }
       continue;
     }
 

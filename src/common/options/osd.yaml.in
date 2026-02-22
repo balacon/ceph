@@ -883,6 +883,25 @@ options:
   default: 50
   fmt_desc: The number of OSD maps to keep cached.
   with_legacy: true
+- name: osd_map_checkpoint_interval
+  type: int
+  level: advanced
+  desc: Number of epochs between full OSDMap checkpoints. 0 to disable (store full map every epoch, legacy behavior).
+  default: 10
+  min: 0
+  see_also:
+  - osd_map_checkpoint_max_pending
+  with_legacy: true
+- name: osd_map_checkpoint_max_pending
+  type: int
+  level: advanced
+  desc: Hard limit on epochs without a full OSDMap checkpoint. Must be <= osd_map_cache_size to prevent trimming needed incrementals. 0 to disable.
+  default: 40
+  min: 0
+  see_also:
+  - osd_map_checkpoint_interval
+  - osd_map_cache_size
+  with_legacy: true
 - name: osd_pg_epoch_max_lag_factor
   type: float
   level: advanced

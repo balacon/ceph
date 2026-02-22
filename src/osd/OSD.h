@@ -1895,6 +1895,16 @@ protected:
   void note_up_osd(int osd);
   friend struct C_OnMapCommit;
 
+  // --- incremental osdmap checkpoint ---
+  // Protected by service.map_cache_lock — same lock as try_get_map,
+  // so the checkpoint state is always consistent with map lookups.
+  epoch_t last_checkpoint_epoch = 0;  // latest epoch with full map on disk
+  epoch_t map_checkpoint_max_pending = 0;  // set once at init, don't change at runtime
+  bool checkpoint_inflight = false;
+  Finisher map_checkpoint_finisher;
+  void queue_map_checkpoint(epoch_t epoch, OSDMapRef osdmap, uint64_t features);
+  void flush_checkpoint();
+
   std::optional<epoch_t> get_epoch_from_osdmap_object(const ghobject_t& osdmap);
   /**
    * trim_stale_maps
@@ -1913,6 +1923,7 @@ protected:
     ThreadPool::TPHandle &handle,
     PeeringCtx &rctx);
   void consume_map();
+  void replay_osdmap_incrementals();
   void activate_map();
 
   // osd map cache (past osd maps)
